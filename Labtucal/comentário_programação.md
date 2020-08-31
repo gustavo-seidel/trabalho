@@ -1006,7 +1006,7 @@ void AD5726_SetVoltage(AD5726 *Ad, unsigned int Channel, u16 Code)
 
 ## `Dados de temperatura e pressão`
 ---
-As medidas de temperatura e pressão adquiridas pelos termopares e transdutor de pressão são processadas e adquiridas pelo [ads1248](https://www.ti.com/lit/ds/symlink/ads1248.pdf?ts=1598885620319&ref_url=https%253A%252F%252Fwww.ti.com%252Fproduct%252FADS1248) e a programação converte os dados.
+As medidas de temperatura obtidas pelos termopares são processadas pelo [ads1248](https://www.ti.com/lit/ds/symlink/ads1248.pdf?ts=1598885620319&ref_url=https%253A%252F%252Fwww.ti.com%252Fproduct%252FADS1248), enviadas para o processador da microzed que então as envia para o labview onde serão tratadas para serem lidas.
 ---
 
 ### *_ads1428.h_*
@@ -1100,4 +1100,694 @@ float ADS1248_Raw2Temp(s32 Data);
 
 ```
 
-O programa controla o CI pela interface SPI
+#### O programa e controla o CI pela interface SPI endereçando seus pinos para enviar sinais de comando.Também cria variavel do tipo _struct_  com ponteiros apontando para GPIOs 
+#### Declara as funções que serão usadas para inicializar a comunicação com o periférico ADS1248,mas do que iniciar o dispositivo elas irão receber os dados de temperatura dos termopares.
+
+## *_ads1248_*
+```
+#include <math.h>
+#include <sleep.h>
+
+#include <ads1248.h>
+#include <util.h>
+
+static void ADS1248_WaitReady(ADS1248 *Ad);
+static void ADS1248_SetPosChan(ADS1248 *Ad, u8 Chan);
+static void ADS1248_SetNegChan(ADS1248 *Ad, u8 Chan);
+static void ADS1248_SetIDAC1Chan(ADS1248 *Ad, u8 Chan);
+static void ADS1248_Sync(ADS1248 *Ad);
+static void ADS1248_Command(ADS1248 *Ad, u8 Command);
+static int ADS1248_Transfer(XSpi *InstancePtr, u8 *SendBufPtr, u8 *RecvBufPtr,
+		unsigned int ByteCount);
+static void ADS1248_WriteReg(ADS1248 *Ad, u8 Reg, u8 Value);
+static u8 ADS1248_ReadReg(ADS1248 *Ad, u8 Reg);
+
+/*
+ * TODO: ADS1248_WriteReg() and ADS1248_ReadReg() are blocking functions. Find
+ * a way to make them non-blocking.
+ */
+int ADS1248_Init(ADS1248 *Ad, u16 SpiId, XGpioPs *Gpio)
+{
+	u8 Value;
+
+	/*
+	 * Initialize the SPI device.
+	 */
+	if ((Ad->SpiConfig = XSpi_LookupConfig(SpiId)) == NULL) {
+		return XST_FAILURE;
+	}
+
+	if (XSpi_CfgInitialize(&(Ad->Spi), Ad->SpiConfig,
+			Ad->SpiConfig->BaseAddress) != XST_SUCCESS) {
+		return XST_FAILURE;
+	}
+
+	/*
+	 * Perform a self-test to check hardware build. The self test resets all
+	 * registers and thus must be performed before configuring the device.
+	 */
+	if (XSpi_SelfTest(&(Ad->Spi)) != XST_SUCCESS) {
+		return XST_FAILURE;
+	}
+
+	/*
+	 * Configure the SPI device.
+	 */
+	if (XSpi_SetOptions(&(Ad->Spi), ADS1248_SPI_OPTIONS) != XST_SUCCESS) {
+		return XST_FAILURE;
+	}
+
+	/*
+	 * Start the SPI driver so that the device is enabled.
+	 */
+	XSpi_Start(&(Ad->Spi));
+
+	/*
+	 * Disable interrupts to use polled mode operation.
+	 */
+	XSpi_IntrGlobalDisable(&(Ad->Spi));
+
+	/*
+	 * Using slave 0.
+	 */
+	XSpi_SetSlaveSelect(&(Ad->Spi), 1);
+
+	Ad->Gpio = Gpio;
+
+	/*
+	 * Set DRDY as input.
+	 */
+	XGpioPs_SetDirectionPin(Ad->Gpio, ADS1248_DRDY_PIN, 0);
+	XGpioPs_SetOutputEnablePin(Ad->Gpio, ADS1248_DRDY_PIN, 0);
+
+	/*
+	 * Set START and RESET as outputs.
+	 */
+	XGpioPs_SetDirectionPin(Ad->Gpio, ADS1248_START_PIN, 1);
+	XGpioPs_SetOutputEnablePin(Ad->Gpio, ADS1248_START_PIN, 1);
+	XGpioPs_SetDirectionPin(Ad->Gpio, ADS1248_RESET_PIN, 1);
+	XGpioPs_SetOutputEnablePin(Ad->Gpio, ADS1248_RESET_PIN, 1);
+
+	/*
+	 * Reset the device.
+	 */
+	XGpioPs_WritePin(Ad->Gpio, ADS1248_RESET_PIN, 0);
+	/*
+	 * Delay > 4/4.096M delay.
+	 */
+	usleep(1);
+	XGpioPs_WritePin(Ad->Gpio, ADS1248_RESET_PIN, 1);
+	/*
+	 * Delay > 0.6 ms.
+	 */
+	usleep(1000);
+
+	/*
+	 * Assert START.
+	 */
+	XGpioPs_WritePin(Ad->Gpio, ADS1248_START_PIN, 1);
+	/*
+	 * Delay > 3/4.096M.
+	 */
+	usleep(1);
+
+	/*
+	 * Prevent new data from interrupting data or register transactions.
+	 */
+	ADS1248_Command(Ad, ADS1248_SDATAC);
+
+	/*
+	 * Internal oscillator, internal reference always on and REFN0 and REFP0
+	 * used as ADC reference.
+	 */
+	Value = (0<<DS3231_MUX1_CLKSTAT) | (1<<DS3231_MUX1_VREFCON) |
+			(0<<DS3231_MUX1_REFSELT) | (0<<DS3231_MUX1_MUXCAL);
+	ADS1248_WriteReg(Ad, ADS1248_MUX1, Value);
+
+	/*
+	 * DOUT/DRDY functions as Data Out, 1 mA excitation current.
+	 */
+	Value = (0<<DS3231_IDAC0_DRDY_MODE) | (6<<DS3231_IDAC0_IMAG);
+	ADS1248_WriteReg(Ad, ADS1248_IDAC0, Value);
+
+	/*
+	 * ADS1248 configured in single-ended mode. Its negative channel is always
+	 * the same.
+	 */
+	ADS1248_SetNegChan(Ad, ADS1248_NEG_CHAN);
+
+	/*
+	 * 	PGA gain set to 1 and 2000 SPS.
+	 */
+	Value = (0<<DS3231_SYS1_PGA) | (0xF<<DS3231_SYS1_DR);
+	ADS1248_WriteReg(Ad, ADS1248_SYS0, Value);
+
+	/*
+	 * Reset ADC filter and start conversion.
+	 */
+	ADS1248_Sync(Ad);
+
+	return XST_SUCCESS;
+}
+
+void ADS1248_WriteReg(ADS1248 *Ad, u8 Reg, u8 Value)
+{
+	u8 SendBuf[3];
+
+	SendBuf[0] = ADS1248_WREG|(Reg&0x0F);
+	SendBuf[1] = 0;
+	SendBuf[2] = Value;
+
+	ADS1248_Transfer(&(Ad->Spi), SendBuf, NULL, NELEMS(SendBuf));
+}
+
+u8 ADS1248_ReadReg(ADS1248 *Ad, u8 Reg)
+{
+	u8 Buf[3];
+
+	Buf[0] = ADS1248_RREG|(Reg&0x0F);
+	Buf[1] = 0;
+	Buf[2] = 0;
+
+	ADS1248_Transfer(&(Ad->Spi), Buf, Buf, NELEMS(Buf));
+
+	return Buf[2];
+}
+
+s32 ADS1248_GetRaw(ADS1248 *Ad, u8 Chan)
+{
+	s32 Data;
+	u8 Buf[4];
+
+	ADS1248_SetIDAC1Chan(Ad, Chan);
+	ADS1248_SetPosChan(Ad, Chan);
+
+	Buf[0] = ADS1248_RDATA;
+	Buf[1] = ADS1248_NOP;
+	Buf[2] = ADS1248_NOP;
+	Buf[3] = ADS1248_NOP;
+
+	ADS1248_WaitReady(Ad);
+
+	ADS1248_Transfer(&(Ad->Spi), Buf, Buf, NELEMS(Buf));
+
+	Data = (((u32) Buf[1])<<24)&0xFF000000;
+	Data |= (((u32) Buf[2])<<16)&0xFF0000;
+	Data |= (((u32) Buf[3])<<8)&0xFF00;
+	Data >>= 8;
+
+	return Data;
+}
+
+float ADS1248_Raw2Temp(s32 Data)
+{
+	float V, R;
+
+	/*
+	 * 	1 LSB = (2*Vref/Gain)/2^24.
+	 */
+	V = Data*(2*((float) ADS1248_VREF)/((float) ADS1248_GAIN))/(pow(2, 24));
+
+	/*
+	 * Convert voltage to resistance.
+	 */
+	R = V/ADS1248_IMAG;
+
+	/*
+	 * Linear regression based on the sensor's (PPG102A1) RT chart available in:
+	 * http://www.ussensor.com/sites/default/files/downloads/PPG102A1%20REV%20D%20(R-T%20Table).xls
+	 */
+	return R*0.273951952 - 277.8445094466;
+}
+
+void ADS1248_WaitReady(ADS1248 *Ad)
+{
+	/*
+	 * TODO: This might hang the system if the ADS1248 stops working.
+	 */
+	while(!XGpioPs_ReadPin(Ad->Gpio, ADS1248_DRDY_PIN));
+	while(XGpioPs_ReadPin(Ad->Gpio, ADS1248_DRDY_PIN));
+}
+
+void ADS1248_SetPosChan(ADS1248 *Ad, u8 Chan)
+{
+	u8 Tmp;
+
+	Tmp = ADS1248_ReadReg(Ad, ADS1248_MUX0);
+	Tmp = (Tmp&0xC7)|((Chan<<3)&0x38);
+	ADS1248_WriteReg(Ad, ADS1248_MUX0, Tmp);
+}
+
+void ADS1248_SetNegChan(ADS1248 *Ad, u8 Chan)
+{
+	u8 Tmp;
+
+	Tmp = ADS1248_ReadReg(Ad, ADS1248_MUX0);
+	Tmp = (Tmp&0xF8)|(Chan&0x07);
+	ADS1248_WriteReg(Ad, ADS1248_MUX0, Tmp);
+}
+
+void ADS1248_SetIDAC1Chan(ADS1248 *Ad, u8 Chan)
+{
+	u8 Tmp;
+
+	Tmp = (Chan<<DS3231_IDAC1_I1DIR) | (12<<DS3231_IDAC1_I2DIR);
+	ADS1248_WriteReg(Ad, ADS1248_IDAC1, Tmp);
+}
+
+void ADS1248_Sync(ADS1248 *Ad)
+{
+	u8 SendBuf[2];
+
+	SendBuf[0] = ADS1248_SYNC;
+	SendBuf[1] = ADS1248_SYNC;
+
+	ADS1248_Transfer(&(Ad->Spi), SendBuf, NULL, NELEMS(SendBuf));
+}
+
+void ADS1248_Command(ADS1248 *Ad, u8 Command)
+{
+	u8 SendBuf[1];
+
+	SendBuf[0] = Command;
+
+	ADS1248_Transfer(&(Ad->Spi), SendBuf, NULL, NELEMS(SendBuf));
+}
+
+/*****************************************************************************/
+/**
+* ADS1248_Transfer() is a copy of XSpi_Transfer() modified for the needs of the
+* ADS1248.
+*
+* Transfers the specified data on the SPI bus. If the SPI device is configured
+* to be a master, this function initiates bus communication and sends/receives
+* the data to/from the selected SPI slave. If the SPI device is configured to
+* be a slave, this function prepares the data to be sent/received when selected
+* by a master. For every byte sent, a byte is received.
+*
+* This function/driver operates in interrupt mode and polled mode.
+*  - In interrupt mode this function is non-blocking and the transfer is
+*    initiated by this function and completed by the interrupt service routine.
+*  - In polled mode this function is blocking and the control exits this
+*    function only after all the requested data is transferred.
+*
+* The caller has the option of providing two different buffers for send and
+* receive, or one buffer for both send and receive, or no buffer for receive.
+* The receive buffer must be at least as big as the send buffer to prevent
+* unwanted memory writes. This implies that the byte count passed in as an
+* argument must be the smaller of the two buffers if they differ in size.
+* Here are some sample usages:
+* <pre>
+*	ADS1248_Transfer(InstancePtr, SendBuf, RecvBuf, ByteCount)
+*	The caller wishes to send and receive, and provides two different
+*	buffers for send and receive.
+*
+*	ADS1248_Transfer(InstancePtr, SendBuf, NULL, ByteCount)
+*	The caller wishes only to send and does not care about the received
+*	data. The driver ignores the received data in this case.
+*
+*	ADS1248_Transfer(InstancePtr, SendBuf, SendBuf, ByteCount)
+*	The caller wishes to send and receive, but provides the same buffer
+*	for doing both. The driver sends the data and overwrites the send
+*	buffer with received data as it transfers the data.
+*
+*	ADS1248_Transfer(InstancePtr, RecvBuf, RecvBuf, ByteCount)
+*	The caller wishes to only receive and does not care about sending
+*	data.  In this case, the caller must still provide a send buffer, but
+*	it can be the same as the receive buffer if the caller does not care
+*	what it sends. The device must send N bytes of data if it wishes to
+*	receive N bytes of data.
+* </pre>
+* In interrupt mode, though this function takes a buffer as an argument, the
+* driver can only transfer a limited number of bytes at time. It transfers only
+* one byte at a time if there are no FIFOs, or it can transfer the number of
+* bytes up to the size of the FIFO if FIFOs exist.
+*  - In interrupt mode a call to this function only starts the transfer, the
+*    subsequent transfer of the data is performed by the interrupt service
+*    routine until the entire buffer has been transferred.The status callback
+*    function is called when the entire buffer has been sent/received.
+*  - In polled mode this function is blocking and the control exits this
+*    function only after all the requested data is transferred.
+*
+* As a master, the SetSlaveSelect function must be called prior to this
+* function.
+*
+* @param	InstancePtr is a pointer to the XSpi instance to be worked on.
+* @param	SendBufPtr is a pointer to a buffer of data which is to be sent.
+*		This buffer must not be NULL.
+* @param	RecvBufPtr is a pointer to a buffer which will be filled with
+*		received data. This argument can be NULL if the caller does not
+*		wish to receive data.
+* @param	ByteCount contains the number of bytes to send/receive. The
+*		number of bytes received always equals the number of bytes sent.
+*
+* @return
+*		-XST_SUCCESS if the buffers are successfully handed off to the
+*		driver for transfer. Otherwise, returns:
+*		- XST_DEVICE_IS_STOPPED if the device must be started before
+*		transferring data.
+*		- XST_DEVICE_BUSY indicates that a data transfer is already in
+*		progress. This is determined by the driver.
+*		- XST_SPI_NO_SLAVE indicates the device is configured as a
+*		master and a slave has not yet been selected.
+*
+* @notes
+*
+* This function is not thread-safe.  The higher layer software must ensure that
+* no two threads are transferring data on the SPI bus at the same time.
+*
+******************************************************************************/
+int ADS1248_Transfer(XSpi *InstancePtr, u8 *SendBufPtr,
+		  u8 *RecvBufPtr, unsigned int ByteCount)
+{
+	u32 ControlReg;
+	u32 GlobalIntrReg;
+	u32 StatusReg;
+	u32 Data = 0;
+	u8  DataWidth;
+
+	/*
+	 * The RecvBufPtr argument can be NULL.
+	 */
+	Xil_AssertNonvoid(InstancePtr != NULL);
+	Xil_AssertNonvoid(SendBufPtr != NULL);
+	Xil_AssertNonvoid(ByteCount > 0);
+	Xil_AssertNonvoid(InstancePtr->IsReady == XIL_COMPONENT_IS_READY);
+
+	if (InstancePtr->IsStarted != XIL_COMPONENT_IS_STARTED) {
+		return XST_DEVICE_IS_STOPPED;
+	}
+
+	/*
+	 * Make sure there is not a transfer already in progress. No need to
+	 * worry about a critical section here. Even if the Isr changes the bus
+	 * flag just after we read it, a busy error is returned and the caller
+	 * can retry when it gets the status handler callback indicating the
+	 * transfer is done.
+	 */
+	if (InstancePtr->IsBusy) {
+		return XST_DEVICE_BUSY;
+	}
+
+	/*
+	 * Save the Global Interrupt Enable Register.
+	 */
+	GlobalIntrReg = XSpi_IsIntrGlobalEnabled(InstancePtr);
+
+	/*
+	 * Enter a critical section from here to the end of the function since
+	 * state is modified, an interrupt is enabled, and the control register
+	 * is modified (r/m/w).
+	 */
+	XSpi_IntrGlobalDisable(InstancePtr);
+
+	ControlReg = XSpi_GetControlReg(InstancePtr);
+
+	/*
+	 * If configured as a master, be sure there is a slave select bit set
+	 * in the slave select register. If no slaves have been selected, the
+	 * value of the register will equal the mask.  When the device is in
+	 * loopback mode, however, no slave selects need be set.
+	 */
+	if (ControlReg & XSP_CR_MASTER_MODE_MASK) {
+		if ((ControlReg & XSP_CR_LOOPBACK_MASK) == 0) {
+			if (InstancePtr->SlaveSelectReg ==
+				InstancePtr->SlaveSelectMask) {
+				if (GlobalIntrReg == TRUE) {
+					/* Interrupt Mode of operation */
+					XSpi_IntrGlobalEnable(InstancePtr);
+				}
+				return XST_SPI_NO_SLAVE;
+			}
+		}
+	}
+
+	/*
+	 * Set the busy flag, which will be cleared when the transfer
+	 * is completely done.
+	 */
+	InstancePtr->IsBusy = TRUE;
+
+	/*
+	 * Set up buffer pointers.
+	 */
+	InstancePtr->SendBufferPtr = SendBufPtr;
+	InstancePtr->RecvBufferPtr = RecvBufPtr;
+
+	InstancePtr->RequestedBytes = ByteCount;
+	InstancePtr->RemainingBytes = ByteCount;
+
+	DataWidth = InstancePtr->DataWidth;
+
+	/*
+	 * Fill the DTR/FIFO with as many bytes as it will take (or as many as
+	 * we have to send). We use the tx full status bit to know if the device
+	 * can take more data. By doing this, the driver does not need to know
+	 * the size of the FIFO or that there even is a FIFO. The downside is
+	 * that the status register must be read each loop iteration.
+	 */
+	StatusReg = XSpi_GetStatusReg(InstancePtr);
+
+	while (((StatusReg & XSP_SR_TX_FULL_MASK) == 0) &&
+		(InstancePtr->RemainingBytes > 0)) {
+		if (DataWidth == XSP_DATAWIDTH_BYTE) {
+			/*
+			 * Data Transfer Width is Byte (8 bit).
+			 */
+			Data = *InstancePtr->SendBufferPtr;
+		} else if (DataWidth == XSP_DATAWIDTH_HALF_WORD) {
+			/*
+			 * Data Transfer Width is Half Word (16 bit).
+			 */
+			Data = *(u16 *)InstancePtr->SendBufferPtr;
+		} else if (DataWidth == XSP_DATAWIDTH_WORD){
+			/*
+			 * Data Transfer Width is Word (32 bit).
+			 */
+			Data = *(u32 *)InstancePtr->SendBufferPtr;
+		}
+
+		XSpi_WriteReg(InstancePtr->BaseAddr, XSP_DTR_OFFSET, Data);
+		InstancePtr->SendBufferPtr += (DataWidth >> 3);
+		InstancePtr->RemainingBytes -= (DataWidth >> 3);
+		StatusReg = XSpi_GetStatusReg(InstancePtr);
+	}
+
+
+	/*
+	 * Set the slave select register to select the device on the SPI before
+	 * starting the transfer of data.
+	 */
+	XSpi_SetSlaveSelectReg(InstancePtr,
+				InstancePtr->SlaveSelectReg);
+
+	/*
+	 * ADS1248 expects at least 10 ns between slave select and the start of
+	 * data transfer.
+	 */
+	usleep(1);
+
+	/*
+	 * Start the transfer by no longer inhibiting the transmitter and
+	 * enabling the device. For a master, this will in fact start the
+	 * transfer, but for a slave it only prepares the device for a transfer
+	 * that must be initiated by a master.
+	 */
+	ControlReg = XSpi_GetControlReg(InstancePtr);
+	ControlReg &= ~XSP_CR_TRANS_INHIBIT_MASK;
+	XSpi_SetControlReg(InstancePtr, ControlReg);
+
+	/*
+	 * TODO: Without waiting after setting the control register, the program
+	 * execution gets stuck in the while below.
+	 */
+	usleep(100);
+
+	/*
+	 * If the interrupts are enabled as indicated by Global Interrupt
+	 * Enable Register, then enable the transmit empty interrupt to operate
+	 * in Interrupt mode of operation.
+	 */
+	if (GlobalIntrReg == TRUE) { /* Interrupt Mode of operation */
+
+		/*
+		 * Enable the transmit empty interrupt, which we use to
+		 * determine progress on the transmission.
+		 */
+		XSpi_IntrEnable(InstancePtr, XSP_INTR_TX_EMPTY_MASK);
+
+		/*
+		 * End critical section.
+		 */
+		XSpi_IntrGlobalEnable(InstancePtr);
+
+	} else { /* Polled mode of operation */
+
+		/*
+		 * If interrupts are not enabled, poll the status register to
+		 * Transmit/Receive SPI data.
+		 */
+		while(ByteCount > 0) {
+
+			/*
+			 * Wait for the transfer to be done by polling the
+			 * Transmit empty status bit
+			 */
+			do {
+				StatusReg = XSpi_GetStatusReg(InstancePtr);
+			} while ((StatusReg & XSP_SR_TX_EMPTY_MASK) == 0);
+
+			/*
+			 * A transmit has just completed. Process received data
+			 * and check for more data to transmit. Always inhibit
+			 * the transmitter while the transmit register/FIFO is
+			 * being filled, or make sure it is stopped if we're
+			 * done.
+			 */
+			ControlReg = XSpi_GetControlReg(InstancePtr);
+			XSpi_SetControlReg(InstancePtr, ControlReg |
+						XSP_CR_TRANS_INHIBIT_MASK);
+
+			/*
+			 * First get the data received as a result of the
+			 * transmit that just completed. We get all the data
+			 * available by reading the status register to determine
+			 * when the Receive register/FIFO is empty. Always get
+			 * the received data, but only fill the receive
+			 * buffer if it points to something (the upper layer
+			 * software may not care to receive data).
+			 */
+			StatusReg = XSpi_GetStatusReg(InstancePtr);
+
+			while ((StatusReg & XSP_SR_RX_EMPTY_MASK) == 0) {
+
+				Data = XSpi_ReadReg(InstancePtr->BaseAddr,
+								XSP_DRR_OFFSET);
+				if (DataWidth == XSP_DATAWIDTH_BYTE) {
+					/*
+					 * Data Transfer Width is Byte (8 bit).
+					 */
+					if(InstancePtr->RecvBufferPtr != NULL) {
+						*InstancePtr->RecvBufferPtr++ =
+							(u8)Data;
+					}
+				} else if (DataWidth ==
+						XSP_DATAWIDTH_HALF_WORD) {
+					/*
+					 * Data Transfer Width is Half Word
+					 * (16 bit).
+					 */
+					if (InstancePtr->RecvBufferPtr != NULL){
+					    *(u16 *)InstancePtr->RecvBufferPtr =
+							(u16)Data;
+						InstancePtr->RecvBufferPtr += 2;
+					}
+				} else if (DataWidth == XSP_DATAWIDTH_WORD) {
+					/*
+					 * Data Transfer Width is Word (32 bit).
+					 */
+					if (InstancePtr->RecvBufferPtr != NULL){
+					    *(u32 *)InstancePtr->RecvBufferPtr =
+							Data;
+						InstancePtr->RecvBufferPtr += 4;
+					}
+				}
+				InstancePtr->Stats.BytesTransferred +=
+						(DataWidth >> 3);
+				ByteCount -= (DataWidth >> 3);
+				StatusReg = XSpi_GetStatusReg(InstancePtr);
+			}
+
+			if (InstancePtr->RemainingBytes > 0) {
+
+				/*
+				 * Fill the DTR/FIFO with as many bytes as it
+				 * will take (or as many as we have to send).
+				 * We use the Tx full status bit to know if the
+				 * device can take more data.
+				 * By doing this, the driver does not need to
+				 * know the size of the FIFO or that there even
+				 * is a FIFO.
+				 * The downside is that the status must be read
+				 * each loop iteration.
+				 */
+				StatusReg = XSpi_GetStatusReg(InstancePtr);
+
+				while(((StatusReg & XSP_SR_TX_FULL_MASK)== 0) &&
+					(InstancePtr->RemainingBytes > 0)) {
+					if (DataWidth == XSP_DATAWIDTH_BYTE) {
+						/*
+						 * Data Transfer Width is Byte
+						 * (8 bit).
+						 */
+						Data = *InstancePtr->
+								SendBufferPtr;
+
+					} else if (DataWidth ==
+						XSP_DATAWIDTH_HALF_WORD) {
+
+						/*
+						 * Data Transfer Width is Half
+						 * Word (16 bit).
+						 */
+						Data = *(u16 *)InstancePtr->
+								SendBufferPtr;
+					} else if (DataWidth ==
+							XSP_DATAWIDTH_WORD) {
+						/*
+						 * Data Transfer Width is Word
+						 * (32 bit).
+						 */
+						Data = *(u32 *)InstancePtr->
+								SendBufferPtr;
+					}
+					XSpi_WriteReg(InstancePtr->BaseAddr,
+							XSP_DTR_OFFSET, Data);
+					InstancePtr->SendBufferPtr +=
+							(DataWidth >> 3);
+					InstancePtr->RemainingBytes -=
+							(DataWidth >> 3);
+					StatusReg = XSpi_GetStatusReg(
+							InstancePtr);
+				}
+
+				/*
+				 * Start the transfer by not inhibiting the
+				 * transmitter any longer.
+				 */
+				ControlReg = XSpi_GetControlReg(InstancePtr);
+				ControlReg &= ~XSP_CR_TRANS_INHIBIT_MASK;
+				XSpi_SetControlReg(InstancePtr, ControlReg);
+			}
+		}
+
+		/*
+		 * Stop the transfer (hold off automatic sending) by inhibiting
+		 * the transmitter.
+		 */
+		ControlReg = XSpi_GetControlReg(InstancePtr);
+		XSpi_SetControlReg(InstancePtr,
+				    ControlReg | XSP_CR_TRANS_INHIBIT_MASK);
+
+		/*
+		 * Wait at least 7/4096000 seconds before deassert slave select.
+		 */
+		usleep(2);
+
+		/*
+		 * Select the slave on the SPI bus when the transfer is
+		 * complete, this is necessary for some SPI devices,
+		 * such as serial EEPROMs work correctly as chip enable
+		 * may be connected to slave select
+		 */
+		XSpi_SetSlaveSelectReg(InstancePtr,
+					InstancePtr->SlaveSelectMask);
+		InstancePtr->IsBusy = FALSE;
+	}
+
+	return XST_SUCCESS;
+}
+
+```
+#### Declaradas funções para ler e escrever  pelas interfaces GPOIO e SPI 
+#### 
