@@ -1004,7 +1004,7 @@ void AD5726_SetVoltage(AD5726 *Ad, unsigned int Channel, u16 Code)
 * Cria os buffers para enviar os bytes de comando
 * Envia os bytes de comando 
 
-## `Dados de temperatura e pressão`
+## `Dados de temperatura`
 ---
 As medidas de temperatura obtidas pelos termopares são processadas pelo [ads1248](https://www.ti.com/lit/ds/symlink/ads1248.pdf?ts=1598885620319&ref_url=https%253A%252F%252Fwww.ti.com%252Fproduct%252FADS1248), enviadas para o processador da microzed que então as envia para o labview onde serão tratadas para serem lidas.
 ---
@@ -1100,7 +1100,7 @@ float ADS1248_Raw2Temp(s32 Data);
 
 ```
 
-#### O programa e controla o CI pela interface SPI endereçando seus pinos para enviar sinais de comando.Também cria variavel do tipo _struct_  com ponteiros apontando para GPIOs 
+#### O programa controls o CI pela interface SPI endereçando seus pinos para enviar sinais de comando.Também cria variavel do tipo _struct_  com ponteiros apontando para GPIOs 
 #### Declara as funções que serão usadas para inicializar a comunicação com o periférico ADS1248,mas do que iniciar o dispositivo elas irão receber os dados de temperatura dos termopares.
 
 ## *_ads1248_*
@@ -1790,4 +1790,33 @@ int ADS1248_Transfer(XSpi *InstancePtr, u8 *SendBufPtr,
 
 ```
 #### Declaradas funções para ler e escrever  pelas interfaces GPOIO e SPI 
-#### 
+#### Descreve a função que irá iniciar o ads1248
+1. ADS1248 init () 
+* verifica se as configurações estão sendo feitas com sucesso
+* depois das configurações verificadas inicia comunicação via SPI
+* colo SPI no modo polling, na qual espera um sinal do ads1248 para enviar uma resposta 
+* liga ads1248
+* recebe o valor para fazer o clock,pois SPI é sincrona
+* configura o modo de sinalização de extremidade única
+* converte os dados em valores 
+2. writeReg ()
+* envia um registro para ads1248
+3. readReg 
+* le os registros recebidos e os aramzena em um buffer
+4. GetRaw ()
+* aguarda o recebimento dos bufers
+* envia os bufers via SPI
+---
+5. Raw2Temp ()
+* função que converte os dados recebidos de tensão e calcula e retorna o valor da **temperatura**.
+calcula a temperatura com o valor da resistência usando a conversão dada no site do sensor.
+---
+6. SetPosChan ()
+* configura o canal positivo 
+7. SetNegChan () 
+* configura o canal negativo
+8. Sync ()
+* sincronização para que dois mecanismos não acessem o mesmo ponto crítico
+9. Command ()
+* configura um bufer para receber a variavel comando
+
